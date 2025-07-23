@@ -54,28 +54,28 @@ for finger, (note, freq) in finger_notes.items():
     wavfile.write(filename, 44100, wave_int16)
     print(f'✓ 已生成: {filename} -> {note} ({freq:.2f} Hz)')
 
-# 额外生成原始的do re mi sol la文件（可选）
-print('\n生成原始音调文件...')
-original_notes = {
-    'do': 261.63,   # C
-    're': 293.66,   # D  
-    'mi': 329.63,   # E
-    'sol': 392.00,  # G
-    'la': 440.00    # A
-}
+# # 额外生成原始的do re mi sol la文件（可选）
+# print('\n生成原始音调文件...')
+# original_notes = {
+#     'do': 261.63,   # C
+#     're': 293.66,   # D  
+#     'mi': 329.63,   # E
+#     'sol': 392.00,  # G
+#     'la': 440.00    # A
+# }
 
-for note, freq in original_notes.items():
-    wave = generate_tone(freq, duration=1.0)
-    wave_int16 = (wave * 32767 * 0.7).astype(np.int16)
-    wavfile.write(f'{note}.wav', 44100, wave_int16)
-    print(f'✓ 已生成: {note}.wav ({freq:.2f} Hz)')
+# for note, freq in original_notes.items():
+#     wave = generate_tone(freq, duration=1.0)
+#     wave_int16 = (wave * 32767 * 0.7).astype(np.int16)
+#     wavfile.write(f'{note}.wav', 44100, wave_int16)
+#     print(f'✓ 已生成: {note}.wav ({freq:.2f} Hz)')
 
 print('\n' + '='*50)
 print('完成！生成的文件：')
 print('手势识别专用文件（在sounds/文件夹中）：')
 for finger, (note, freq) in finger_notes.items():
     print(f'  sounds/{finger}.wav -> {note}')
-print('\n原始音调文件（在项目根目录）：')
-for note in original_notes.keys():
-    print(f'  {note}.wav')
+# print('\n原始音调文件（在项目根目录）：')
+# for note in original_notes.keys():
+#     print(f'  {note}.wav')
 print('\n现在可以运行手势识别程序了！')
