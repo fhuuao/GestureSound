@@ -1,4 +1,3 @@
-# 这个程序可以识别手指弯曲的程度
 import cv2
 import mediapipe as mp # type: ignore
 import time
@@ -6,11 +5,14 @@ import serial
 import threading
 import json
 import math
+import os
+import sys
+import subprocess
 from collections import deque
 
 # 定义每个手指的角度范围（根据实际测试调整）
 FINGER_ANGLE_RANGES = {
-    "thumb": {"min": 130, "max": 180},   # 拇指角度范围：120°=弯曲(0), 180°=伸直(1)
+    "thumb": {"min": 120, "max": 180},   # 拇指角度范围：120°=弯曲(0), 180°=伸直(1)
     "index": {"min": 5, "max": 180},     # 食指角度范围
     "middle": {"min": 5, "max": 180},    # 中指角度范围
     "ring": {"min": 5, "max": 180},      # 无名指角度范围
@@ -240,24 +242,10 @@ def calculate_thumb_improved(lmList):
     final_score = sum(score * weight for score, weight in zip(detection_scores, weights))
     
     # 判断弯曲状态
-    is_bent = final_score > 0.2  # 降低阈值，提高敏感度
+    is_bent = final_score > 0.4  # 降低阈值，提高敏感度
     
     # 计算综合角度（用于显示）
     main_angle = (angle_cmc_mcp_ip + angle_mcp_ip_tip) / 2
-    
-    # 调试信息
-    debug_info = {
-        "angles": [angle_cmc_mcp_ip, angle_mcp_ip_tip],
-        "distances": [tip_to_wrist, tip_to_index],
-        "projection_ratio": projection_ratio,
-        "lateral_offset": lateral_offset,
-        "hand_type": hand_type,
-        "scores": detection_scores,
-        "final_score": final_score
-    }
-    
-    # 可以在调试时打印这些信息
-    # print(f"Thumb debug: {debug_info}")
     
     return main_angle, is_bent
 
@@ -324,7 +312,7 @@ def calculate_finger_angles_and_states(lmList):
             [lmList[20][1], lmList[20][2]]  # TIP
         )
         # 小指弯曲判断：角度判断
-        states["pinky"] = angles["pinky"] < 60
+        states["pinky"] = angles["pinky"] < 120
     
     return angles, states
 
@@ -340,12 +328,125 @@ def serial_monitor(ser):
             break
         time.sleep(0.01)
 
-def main():
-    prevTime = 0
+def check_and_install_dependencies():
+    """检查并提示安装必要的依赖"""
+    missing_deps = []
     
-    # 帧计数器和处理间隔
+    try:
+        import pygame
+    except ImportError:
+        missing_deps.append("pygame")
+    
+    try:
+        import numpy as np
+        from scipy.io import wavfile
+    except ImportError:
+        missing_deps.append("numpy scipy")
+    
+    if missing_deps:
+        print("❌ 缺少必要的依赖包，请安装:")
+        print(f"pip install {' '.join(missing_deps)}")
+        return False
+    
+    return True
+
+def setup_audio_system():
+    """设置音频系统：生成音频文件并启动播放器"""
+    print("🎵 设置音频系统...")
+    
+    # 检查是否需要生成音频文件
+    if not os.path.exists("sounds") or len([f for f in os.listdir("sounds") if f.endswith('.wav')]) < 5:
+        print("📝 生成音频文件...")
+        try:
+            result = subprocess.run([sys.executable, "five_tones.py"], 
+                                  capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                print(f"❌ 音频生成失败: {result.stderr}")
+                return None
+            print("✅ 音频文件生成完成")
+        except subprocess.TimeoutExpired:
+            print("❌ 音频生成超时")
+            return None
+        except FileNotFoundError:
+            print("❌ 找不到 five_tones.py 文件")
+            return None
+    else:
+        print("✅ 音频文件已存在")
+    
+    # 启动音频播放器进程
+    print("🎧 启动音频播放器...")
+    try:
+        audio_process = subprocess.Popen(
+            [sys.executable, "audio_player.py"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        
+        # 给播放器一点时间初始化
+        time.sleep(2)
+        
+        if audio_process.poll() is None:  # 进程仍在运行
+            print("✅ 音频播放器启动成功")
+            return audio_process
+        else:
+            print("❌ 音频播放器启动失败")
+            return None
+            
+    except FileNotFoundError:
+        print("❌ 找不到 audio_player.py 文件")
+        return None
+
+def send_to_audio_player(audio_process, gesture_data):
+    """发送手势数据到音频播放器"""
+    if audio_process and audio_process.stdin:
+        try:
+            json_msg = json.dumps(gesture_data, separators=(',', ':'))
+            audio_process.stdin.write(json_msg + '\n')
+            audio_process.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError):
+            print("⚠️ 音频播放器连接断开")
+            return False
+    return False
+
+def main():
+    print("🎵 模块化手势识别音乐系统")
+    print("=" * 50)
+    
+    # 检查依赖
+    if not check_and_install_dependencies():
+        return
+    
+    # 设置音频系统
+    audio_process = setup_audio_system()
+    if not audio_process:
+        print("❌ 音频系统设置失败，程序退出")
+        return
+    
+    # 设置串口
+    ser = None
+    try:
+        ser = serial.Serial(
+            port="COM24",
+            baudrate=9600,
+            timeout=0.1,
+            write_timeout=1
+        )
+        print(f"✅ 串口 {ser.port} 连接成功")
+        
+        # 启动串口监听线程
+        serial_thread = threading.Thread(target=serial_monitor, args=(ser,), daemon=True)
+        serial_thread.start()
+        
+    except serial.SerialException as e:
+        print(f"⚠️ 串口连接失败: {e} (将继续运行，但不发送数据到Arduino)")
+    
+    # 主要的手势识别逻辑
+    prevTime = 0
     frame_count = 0
-    PROCESSING_INTERVAL = 1
     
     # 创建滑动窗口存储最近5帧的角度数据
     WINDOW_SIZE = 5
@@ -389,29 +490,9 @@ def main():
     }
 
     try:
-        # 串口配置
-        ser = serial.Serial(
-            port="COM24",
-            baudrate=9600,
-            timeout=0.1,
-            write_timeout=1
-        )
-        print(f"Serial port {ser.port} opened successfully")
-        time.sleep(2)
-        
-        # 启动串口监听线程
-        serial_thread = threading.Thread(target=serial_monitor, args=(ser,), daemon=True)
-        serial_thread.start()
-        print("Serial monitor started")
-        
-    except serial.SerialException as e:
-        print(f"Failed to open serial port: {e}")
-        return
-
-    try:
         cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         if not cap.isOpened():
-            print("Failed to open camera")
+            print("❌ 无法打开摄像头")
             return
             
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
@@ -423,15 +504,20 @@ def main():
         cv2.namedWindow("Hand Gesture Control", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Hand Gesture Control", 800, 600)
         
-        print(f"System ready. Averaging over {WINDOW_SIZE} frames.")
-        print("Press 'q' to quit.")
-        print("Arduino will receive JSON data with angles, normalized angles, and states")
-        print("Try making various thumb gestures to test the improved detection!")
+        print("\n🚀 系统启动完成！")
+        print("📸 摄像头已就绪")
+        print("🎵 音频播放已就绪")
+        if ser:
+            print("📡 Arduino串口通信已就绪")
+        print("💡 弯曲手指即可播放音乐！")
+        print("🎹 大拇指=do, 食指=re, 中指=mi, 无名指=sol, 小指=la")
+        print("❌ 按 'q' 退出程序")
+        print("-" * 60)
 
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("Failed to read frame")
+                print("❌ 无法读取摄像头画面")
                 break
                 
             frame_count += 1
@@ -458,7 +544,7 @@ def main():
                 normalized_angles = normalize_angles_dict(avg_angles)
                 
                 # 使用改进的状态判断（结合角度和位置）
-                finger_states = current_states  # 使用位置判断的状态
+                finger_states = current_states
                 
                 # 检查是否有状态变化
                 change = False
@@ -470,21 +556,24 @@ def main():
                 
                 if change:
                     # 更新当前手势状态
-                    current_gesture["timestamp"] = int(time.time() * 1000)  # 毫秒时间戳
+                    current_gesture["timestamp"] = int(time.time() * 1000)
                     current_gesture["angles"] = {k: round(v, 1) for k, v in avg_angles.items()}
                     current_gesture["normalized_angles"] = normalized_angles
                     current_gesture["states"] = finger_states
                     
-                    # 创建JSON消息
-                    json_msg = json.dumps(current_gesture, separators=(',', ':')) + '\n'
+                    # 发送到音频播放器
+                    if not send_to_audio_player(audio_process, current_gesture):
+                        print("⚠️ 音频播放器连接中断，尝试重启...")
+                        # 可以在这里添加重启音频播放器的逻辑
                     
-                    print(f"[Python] Sending JSON: {json_msg.strip()}")
-                    
-                    try:
-                        ser.write(json_msg.encode('utf-8'))
-                        ser.flush()
-                    except serial.SerialException as e:
-                        print(f"[Python] Serial write error: {e}")
+                    # 发送到Arduino（如果连接）
+                    if ser and ser.is_open:
+                        try:
+                            json_msg = json.dumps(current_gesture, separators=(',', ':')) + '\n'
+                            ser.write(json_msg.encode('utf-8'))
+                            ser.flush()
+                        except serial.SerialException as e:
+                            print(f"❌ 串口发送错误: {e}")
             
             # 计算并显示FPS
             currentTime = time.time()
@@ -494,7 +583,7 @@ def main():
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
             prevTime = currentTime
             
-            # 显示角度信息（显示原始角度和归一化值）
+            # 显示角度信息
             y_offset = 60
             fingers = ["thumb", "index", "middle", "ring", "pinky"]
             finger_names = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
@@ -512,10 +601,10 @@ def main():
                     
                     cv2.putText(frame, text, (10, y_offset + i * 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                    
-            # 显示最后发送的JSON信息（显示归一化角度）
-            json_preview = json.dumps(current_gesture["normalized_angles"], separators=(',', ':'))
-            cv2.putText(frame, f"Normalized: {json_preview}", (10, y_offset + 5 * 30 + 20), 
+            
+            # 显示音频播放器状态
+            audio_status = "🎵 Audio: Running" if audio_process and audio_process.poll() is None else "❌ Audio: Stopped"
+            cv2.putText(frame, audio_status, (10, y_offset + 5 * 30 + 20), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
             cv2.imshow("Hand Gesture Control", frame)
@@ -524,16 +613,30 @@ def main():
                 break
 
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"❌ 程序运行出错: {e}")
     
     finally:
+        # 清理资源
         if 'cap' in locals():
             cap.release()
-        if 'ser' in locals() and ser.is_open:
+        
+        if ser and ser.is_open:
             ser.close()
-            print("Serial port closed")
+            print("📡 串口已关闭")
+        
+        # 关闭音频播放器进程
+        if audio_process:
+            try:
+                audio_process.stdin.close()
+                audio_process.terminate()
+                audio_process.wait(timeout=5)
+                print("🎵 音频播放器已关闭")
+            except subprocess.TimeoutExpired:
+                audio_process.kill()
+                print("🎵 强制关闭音频播放器")
+        
         cv2.destroyAllWindows()
-        print("Program terminated")
+        print("✅ 程序已完全退出")
 
 if __name__ == "__main__":
     main()
