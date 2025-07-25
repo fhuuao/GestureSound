@@ -13,13 +13,13 @@ def generate_tone(frequency, duration=1.0, sample_rate=44100):
     # 生成正弦波
     wave = np.sin(2 * np.pi * frequency * t)
     
-    # 添加淡入淡出效果，避免爆音
-    fade_frames = int(0.05 * sample_rate)  # 50ms淡入淡出
+    # # 添加淡入淡出效果，避免爆音
+    # fade_frames = int(0.05 * sample_rate)  # 50ms淡入淡出
     
-    # 淡入
-    wave[:fade_frames] *= np.linspace(0, 1, fade_frames)
-    # 淡出
-    wave[-fade_frames:] *= np.linspace(1, 0, fade_frames)
+    # # 淡入
+    # wave[:fade_frames] *= np.linspace(0, 1, fade_frames)
+    # # 淡出
+    # wave[-fade_frames:] *= np.linspace(1, 0, fade_frames)
     
     return wave
 
