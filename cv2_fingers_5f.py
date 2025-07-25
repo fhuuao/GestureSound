@@ -1,7 +1,6 @@
 import cv2
 import mediapipe as mp # type: ignore
 import time
-import serial
 import threading
 import json
 import math
@@ -9,6 +8,13 @@ import os
 import sys
 import subprocess
 from collections import deque
+
+# 导入自动串口连接模块
+try:
+    from auto_mcu_comm import MicrocontrollerConnection
+except ImportError:
+    print("❌ 无法导入 MicrocontrollerConnection，请确保 auto_mcu_comm.py 文件存在")
+    sys.exit(1)
 
 # 定义每个手指的角度范围（根据实际测试调整）
 FINGER_ANGLE_RANGES = {
@@ -316,15 +322,16 @@ def calculate_finger_angles_and_states(lmList):
     
     return angles, states
 
-def serial_monitor(ser):
+def serial_monitor(mcu_connection):
     """独立线程监听Arduino串口输出"""
     while True:
         try:
-            if ser.in_waiting > 0:
-                arduino_data = ser.readline().decode('utf-8').strip()
+            if mcu_connection.connection and mcu_connection.connection.is_open:
+                arduino_data = mcu_connection.receive(timeout=0.1)
                 if arduino_data:
-                    print(f"[Arduino]: {arduino_data}")
-        except:
+                    print(f"[Arduino]: {arduino_data.strip()}")
+        except Exception as e:
+            print(f"串口监听错误: {e}")
             break
         time.sleep(0.01)
 
@@ -412,6 +419,21 @@ def send_to_audio_player(audio_process, gesture_data):
             return False
     return False
 
+def setup_mcu_connection():
+    """设置单片机连接"""
+    print("\n📡 开始自动检测并连接单片机...")
+    try:
+        mcu = MicrocontrollerConnection(baudrate=9600, timeout=1)
+        if mcu.auto_connect():
+            print(f"✅ 已成功连接到单片机: {mcu.connection.port}")
+            return mcu
+        else:
+            print("⚠️ 无法自动连接到单片机，将继续运行但不发送数据到Arduino")
+            return None
+    except Exception as e:
+        print(f"⚠️ 串口连接设置失败: {e} (将继续运行，但不发送数据到Arduino)")
+        return None
+
 def main():
     print("🎵 模块化手势识别音乐系统")
     print("=" * 50)
@@ -426,23 +448,13 @@ def main():
         print("❌ 音频系统设置失败，程序退出")
         return
     
-    # 设置串口
-    ser = None
-    try:
-        ser = serial.Serial(
-            port="COM24",
-            baudrate=9600,
-            timeout=0.1,
-            write_timeout=1
-        )
-        print(f"✅ 串口 {ser.port} 连接成功")
-        
-        # 启动串口监听线程
-        serial_thread = threading.Thread(target=serial_monitor, args=(ser,), daemon=True)
+    # 设置单片机连接
+    mcu_connection = setup_mcu_connection()
+    
+    # 如果有单片机连接，启动串口监听线程
+    if mcu_connection:
+        serial_thread = threading.Thread(target=serial_monitor, args=(mcu_connection,), daemon=True)
         serial_thread.start()
-        
-    except serial.SerialException as e:
-        print(f"⚠️ 串口连接失败: {e} (将继续运行，但不发送数据到Arduino)")
     
     # 主要的手势识别逻辑
     prevTime = 0
@@ -507,8 +519,8 @@ def main():
         print("\n🚀 系统启动完成！")
         print("📸 摄像头已就绪")
         print("🎵 音频播放已就绪")
-        if ser:
-            print("📡 Arduino串口通信已就绪")
+        if mcu_connection:
+            print(f"📡 Arduino串口通信已就绪 ({mcu_connection.connection.port})")
         print("💡 弯曲手指即可播放音乐！")
         print("🎹 大拇指=do, 食指=re, 中指=mi, 无名指=sol, 小指=la")
         print("❌ 按 'q' 退出程序")
@@ -567,12 +579,11 @@ def main():
                         # 可以在这里添加重启音频播放器的逻辑
                     
                     # 发送到Arduino（如果连接）
-                    if ser and ser.is_open:
+                    if mcu_connection and mcu_connection.connection and mcu_connection.connection.is_open:
                         try:
                             json_msg = json.dumps(current_gesture, separators=(',', ':')) + '\n'
-                            ser.write(json_msg.encode('utf-8'))
-                            ser.flush()
-                        except serial.SerialException as e:
+                            mcu_connection.send(json_msg)
+                        except Exception as e:
                             print(f"❌ 串口发送错误: {e}")
             
             # 计算并显示FPS
@@ -602,10 +613,21 @@ def main():
                     cv2.putText(frame, text, (10, y_offset + i * 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
-            # 显示音频播放器状态
+            # 显示连接状态
             audio_status = "🎵 Audio: Running" if audio_process and audio_process.poll() is None else "❌ Audio: Stopped"
             cv2.putText(frame, audio_status, (10, y_offset + 5 * 30 + 20), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            
+            # 显示串口连接状态
+            if mcu_connection and mcu_connection.connection and mcu_connection.connection.is_open:
+                serial_status = f"📡 Serial: {mcu_connection.connection.port}"
+                color = (0, 255, 0)
+            else:
+                serial_status = "📡 Serial: Disconnected"
+                color = (0, 0, 255)
+            
+            cv2.putText(frame, serial_status, (10, y_offset + 5 * 30 + 45), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
             cv2.imshow("Hand Gesture Control", frame)
 
@@ -620,9 +642,9 @@ def main():
         if 'cap' in locals():
             cap.release()
         
-        if ser and ser.is_open:
-            ser.close()
-            print("📡 串口已关闭")
+        # 关闭串口连接
+        if mcu_connection:
+            mcu_connection.close()
         
         # 关闭音频播放器进程
         if audio_process:
