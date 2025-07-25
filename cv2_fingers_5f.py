@@ -358,33 +358,14 @@ def check_and_install_dependencies():
     return True
 
 def setup_audio_system():
-    """设置音频系统：生成音频文件并启动播放器"""
-    print("🎵 设置音频系统...")
+    """设置音频系统：启动实时音频播放器"""
+    print("🎵 设置实时音频系统...")
     
-    # 检查是否需要生成音频文件
-    if not os.path.exists("sounds") or len([f for f in os.listdir("sounds") if f.endswith('.wav')]) < 5:
-        print("📝 生成音频文件...")
-        try:
-            result = subprocess.run([sys.executable, "five_tones.py"], 
-                                  capture_output=True, text=True, timeout=30)
-            if result.returncode != 0:
-                print(f"❌ 音频生成失败: {result.stderr}")
-                return None
-            print("✅ 音频文件生成完成")
-        except subprocess.TimeoutExpired:
-            print("❌ 音频生成超时")
-            return None
-        except FileNotFoundError:
-            print("❌ 找不到 five_tones.py 文件")
-            return None
-    else:
-        print("✅ 音频文件已存在")
-    
-    # 启动音频播放器进程
-    print("🎧 启动音频播放器...")
+    # 启动实时音频播放器进程
+    print("🎧 启动实时音频播放器...")
     try:
         audio_process = subprocess.Popen(
-            [sys.executable, "audio_player.py"],
+            [sys.executable, "realtime_audio_player.py"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -393,17 +374,17 @@ def setup_audio_system():
         )
         
         # 给播放器一点时间初始化
-        time.sleep(2)
+        time.sleep(1)
         
-        if audio_process.poll() is None:  # 进程仍在运行
-            print("✅ 音频播放器启动成功")
+        if audio_process.poll() is None:
+            print("✅ 实时音频播放器启动成功")
             return audio_process
         else:
-            print("❌ 音频播放器启动失败")
+            print("❌ 实时音频播放器启动失败")
             return None
             
     except FileNotFoundError:
-        print("❌ 找不到 audio_player.py 文件")
+        print("❌ 找不到 realtime_audio_player.py 文件")
         return None
 
 def send_to_audio_player(audio_process, gesture_data):
