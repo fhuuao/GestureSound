@@ -25,6 +25,10 @@ FINGER_ANGLE_RANGES = {
     "pinky": {"min": 5, "max": 180}      # 小指角度范围
 }
 
+# 数据发送频率配置
+ARDUINO_SEND_FREQUENCY = 20    # Arduino数据发送频率 (Hz) - 20Hz适合舵机控制
+AUDIO_SEND_FREQUENCY = 30      # 音频数据发送频率 (Hz) - 30Hz保证音频响应性
+
 def normalize_angle(angle, finger_name):
     """
     将角度归一化到0-1范围
@@ -387,16 +391,30 @@ def setup_audio_system():
         print("❌ 找不到 realtime_audio_player.py 文件")
         return None
 
-def send_to_audio_player(audio_process, gesture_data):
-    """发送手势数据到音频播放器"""
+def send_to_audio_player(audio_process, states_data):
+    """发送手势状态数据到音频播放器"""
     if audio_process and audio_process.stdin:
         try:
-            json_msg = json.dumps(gesture_data, separators=(',', ':'))
+            # 只发送状态信息给音频播放器（无timestamp）
+            json_msg = json.dumps(states_data, separators=(',', ':'))
             audio_process.stdin.write(json_msg + '\n')
             audio_process.stdin.flush()
             return True
         except (BrokenPipeError, OSError):
             print("⚠️ 音频播放器连接断开")
+            return False
+    return False
+
+def send_to_arduino(mcu_connection, normalized_angles):
+    """发送归一化角度数据到Arduino"""
+    if mcu_connection and mcu_connection.connection and mcu_connection.connection.is_open:
+        try:
+            # 只发送归一化角度给Arduino（无timestamp）
+            json_msg = json.dumps(normalized_angles, separators=(',', ':')) + '\n'
+            mcu_connection.send(json_msg)
+            return True
+        except Exception as e:
+            print(f"❌ Arduino串口发送错误: {e}")
             return False
     return False
 
@@ -415,8 +433,65 @@ def setup_mcu_connection():
         print(f"⚠️ 串口连接设置失败: {e} (将继续运行，但不发送数据到Arduino)")
         return None
 
+def data_sender_thread(audio_process, mcu_connection, gesture_data_queue):
+    """数据发送线程 - 以固定频率发送数据"""
+    
+    # 计算发送间隔
+    arduino_interval = 1.0 / ARDUINO_SEND_FREQUENCY  # 秒
+    audio_interval = 1.0 / AUDIO_SEND_FREQUENCY      # 秒
+    
+    last_arduino_send = 0
+    last_audio_send = 0
+    
+    print(f"📡 数据发送线程启动:")
+    print(f"   Arduino频率: {ARDUINO_SEND_FREQUENCY}Hz (间隔: {arduino_interval*1000:.1f}ms)")
+    print(f"   音频频率: {AUDIO_SEND_FREQUENCY}Hz (间隔: {audio_interval*1000:.1f}ms)")
+    
+    arduino_count = 0
+    audio_count = 0
+    
+    while True:
+        try:
+            current_time = time.time()
+            
+            # 尝试获取最新的手势数据（非阻塞）
+            latest_data = None
+            try:
+                while True:  # 获取队列中最新的数据
+                    latest_data = gesture_data_queue.get_nowait()
+            except:
+                pass  # 队列为空，使用之前的数据
+            
+            if latest_data is None:
+                time.sleep(0.001)  # 短暂休眠避免CPU占用过高
+                continue
+            
+            # 发送数据到Arduino（固定频率）
+            if current_time - last_arduino_send >= arduino_interval:
+                if mcu_connection:
+                    if send_to_arduino(mcu_connection, latest_data["normalized_angles"]):
+                        arduino_count += 1
+                        if arduino_count % 100 == 0:  # 每100次打印一次
+                            print(f"📡 Arduino发送计数: {arduino_count}")
+                last_arduino_send = current_time
+            
+            # 发送数据到音频播放器（固定频率）
+            if current_time - last_audio_send >= audio_interval:
+                if send_to_audio_player(audio_process, latest_data["states"]):
+                    audio_count += 1
+                    if audio_count % 150 == 0:  # 每150次打印一次
+                        print(f"🎵 音频发送计数: {audio_count}")
+                last_audio_send = current_time
+            
+            # 短暂休眠以避免CPU占用过高
+            time.sleep(0.001)
+            
+        except Exception as e:
+            print(f"❌ 数据发送线程错误: {e}")
+            time.sleep(0.1)
+
 def main():
-    print("🎵 模块化手势识别音乐系统")
+    print("🎵 模块化手势识别音乐系统 - 固定频率版")
     print("=" * 50)
     
     # 检查依赖
@@ -436,6 +511,18 @@ def main():
     if mcu_connection:
         serial_thread = threading.Thread(target=serial_monitor, args=(mcu_connection,), daemon=True)
         serial_thread.start()
+    
+    # 创建手势数据队列（用于线程间通信）
+    import queue
+    gesture_data_queue = queue.Queue(maxsize=10)  # 限制队列大小避免内存积累
+    
+    # 启动数据发送线程
+    sender_thread = threading.Thread(
+        target=data_sender_thread, 
+        args=(audio_process, mcu_connection, gesture_data_queue), 
+        daemon=True
+    )
+    sender_thread.start()
     
     # 主要的手势识别逻辑
     prevTime = 0
@@ -458,7 +545,6 @@ def main():
     
     # 当前手势状态
     current_gesture = {
-        "timestamp": 0,
         "angles": {
             "thumb": 0,
             "index": 0,
@@ -499,11 +585,14 @@ def main():
         
         print("\n🚀 系统启动完成！")
         print("📸 摄像头已就绪")
-        print("🎵 音频播放已就绪")
+        print(f"🎵 音频播放已就绪 (接收频率: {AUDIO_SEND_FREQUENCY}Hz)")
         if mcu_connection:
-            print(f"📡 Arduino串口通信已就绪 ({mcu_connection.connection.port})")
+            print(f"📡 Arduino串口通信已就绪 ({mcu_connection.connection.port}) (发送频率: {ARDUINO_SEND_FREQUENCY}Hz)")
         print("💡 弯曲手指即可播放音乐！")
         print("🎹 大拇指=do, 食指=re, 中指=mi, 无名指=sol, 小指=la")
+        print("📊 Arduino接收: 归一化角度值 (0.0-1.0)")
+        print("🎵 音频播放器接收: 弯曲状态 (true/false)")
+        print("⏱️ 数据以固定频率稳定发送")
         print("❌ 按 'q' 退出程序")
         print("-" * 60)
 
@@ -526,7 +615,7 @@ def main():
             for finger in angle_history:
                 angle_history[finger].append(current_angles[finger])
             
-            # 每5帧计算一次平均值并发送数据
+            # 每5帧计算一次平均值并更新手势数据
             if frame_count % WINDOW_SIZE == 0:
                 # 计算平均角度
                 avg_angles = {}
@@ -536,36 +625,24 @@ def main():
                 # 归一化角度
                 normalized_angles = normalize_angles_dict(avg_angles)
                 
-                # 使用改进的状态判断（结合角度和位置）
+                # 使用当前状态判断
                 finger_states = current_states
                 
-                # 检查是否有状态变化
-                change = False
-                for finger in avg_angles:
-                    if (abs(avg_angles[finger] - current_gesture["angles"][finger]) > 5 or 
-                        finger_states[finger] != current_gesture["states"][finger]):
-                        change = True
-                        break
+                # 更新当前手势状态
+                current_gesture["angles"] = {k: round(v, 1) for k, v in avg_angles.items()}
+                current_gesture["normalized_angles"] = normalized_angles
+                current_gesture["states"] = finger_states
                 
-                if change:
-                    # 更新当前手势状态
-                    current_gesture["timestamp"] = int(time.time() * 1000)
-                    current_gesture["angles"] = {k: round(v, 1) for k, v in avg_angles.items()}
-                    current_gesture["normalized_angles"] = normalized_angles
-                    current_gesture["states"] = finger_states
-                    
-                    # 发送到音频播放器
-                    if not send_to_audio_player(audio_process, current_gesture):
-                        print("⚠️ 音频播放器连接中断，尝试重启...")
-                        # 可以在这里添加重启音频播放器的逻辑
-                    
-                    # 发送到Arduino（如果连接）
-                    if mcu_connection and mcu_connection.connection and mcu_connection.connection.is_open:
-                        try:
-                            json_msg = json.dumps(current_gesture, separators=(',', ':')) + '\n'
-                            mcu_connection.send(json_msg)
-                        except Exception as e:
-                            print(f"❌ 串口发送错误: {e}")
+                # 将数据放入队列供发送线程使用（非阻塞）
+                try:
+                    gesture_data_queue.put_nowait(current_gesture.copy())
+                except queue.Full:
+                    # 如果队列满了，丢弃旧数据
+                    try:
+                        gesture_data_queue.get_nowait()
+                        gesture_data_queue.put_nowait(current_gesture.copy())
+                    except queue.Empty:
+                        pass
             
             # 计算并显示FPS
             currentTime = time.time()
@@ -594,21 +671,29 @@ def main():
                     cv2.putText(frame, text, (10, y_offset + i * 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
-            # 显示连接状态
-            audio_status = "🎵 Audio: Running" if audio_process and audio_process.poll() is None else "❌ Audio: Stopped"
-            cv2.putText(frame, audio_status, (10, y_offset + 5 * 30 + 20), 
+            # 显示发送频率信息
+            cv2.putText(frame, f"Send Frequency:", (10, y_offset + 5 * 30 + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # 显示音频发送频率
+            cv2.putText(frame, f"Audio: {AUDIO_SEND_FREQUENCY}Hz", (10, y_offset + 5 * 30 + 45), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
             
-            # 显示串口连接状态
+            # 显示Arduino发送频率
             if mcu_connection and mcu_connection.connection and mcu_connection.connection.is_open:
-                serial_status = f"📡 Serial: {mcu_connection.connection.port}"
+                arduino_status = f"Arduino: {ARDUINO_SEND_FREQUENCY}Hz -> {mcu_connection.connection.port}"
                 color = (0, 255, 0)
             else:
-                serial_status = "📡 Serial: Disconnected"
+                arduino_status = f"Arduino: {ARDUINO_SEND_FREQUENCY}Hz -> Disconnected"
                 color = (0, 0, 255)
             
-            cv2.putText(frame, serial_status, (10, y_offset + 5 * 30 + 45), 
+            cv2.putText(frame, arduino_status, (10, y_offset + 5 * 30 + 70), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            
+            # 显示队列状态
+            queue_size = gesture_data_queue.qsize()
+            cv2.putText(frame, f"Queue: {queue_size}/10", (10, y_offset + 5 * 30 + 95), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
             cv2.imshow("Hand Gesture Control", frame)
 
