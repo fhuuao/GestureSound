@@ -6,11 +6,12 @@ import json
 import math
 import os
 import sys
-import subprocess
 from collections import deque
 import traceback
 import gc
 import queue
+import pygame
+import numpy as np
 
 # 导入自动串口连接模块
 try:
@@ -31,13 +32,204 @@ FINGER_ANGLE_RANGES = {
 
 # 数据采集和发送配置
 CAPTURE_FPS = 30               # 摄像头采集帧率
-AUDIO_SEND_FREQUENCY = 30      # 音频数据发送频率 (Hz)
 ARDUINO_AVERAGE_FRAMES = 5     # Arduino数据每N帧平均后发送一次
 ARDUINO_SEND_FREQUENCY = CAPTURE_FPS / ARDUINO_AVERAGE_FRAMES  # 实际Arduino发送频率 6Hz
 
 # 全局状态标志
 system_running = True
 system_error = False
+
+class IntegratedAudioPlayer:
+    """内置音频播放器"""
+    
+    def __init__(self):
+        # 手指对应的音频频率
+        self.frequencies = {
+            "thumb": 261.63,   # do (C)
+            "index": 293.66,   # re (D)
+            "middle": 329.63,  # mi (E)
+            "ring": 392.00,    # sol (G)
+            "pinky": 440.00    # la (A)
+        }
+        
+        # 当前播放状态
+        self.playing = {finger: False for finger in self.frequencies}
+        self.channels = {}
+        
+        # 防抖设置
+        self.last_change = {finger: 0 for finger in self.frequencies}
+        self.debounce_time = 80  # 80ms防抖
+        
+        # 初始化音频
+        if not self._init_audio():
+            raise Exception("音频初始化失败")
+        
+        # 创建音频（短音调）
+        self.sounds = {}
+        for finger, freq in self.frequencies.items():
+            self.sounds[finger] = self._create_tone(freq)
+        
+        print("✅ 内置音频播放器初始化完成")
+    
+    def _init_audio(self):
+        """初始化音频系统"""
+        configs = [
+            {"frequency": 22050, "size": -16, "channels": 2, "buffer": 1024},
+            {"frequency": 22050, "size": -16, "channels": 1, "buffer": 512},
+            {"frequency": 11025, "size": -16, "channels": 2, "buffer": 512},
+            {},  # 默认配置
+        ]
+        
+        for i, config in enumerate(configs):
+            try:
+                pygame.mixer.quit()  # 清理之前的初始化
+                time.sleep(0.1)
+                
+                if config:
+                    pygame.mixer.pre_init(**config)
+                
+                pygame.mixer.init()
+                pygame.mixer.set_num_channels(8)
+                
+                # 测试基本功能
+                freq, size, channels = pygame.mixer.get_init()
+                print(f"✅ 音频系统初始化成功: {freq}Hz, {size}bit, {channels}ch")
+                return True
+                
+            except Exception as e:
+                print(f"⚠️ 音频配置{i+1}失败: {e}")
+                continue
+        
+        print("❌ 所有音频配置都失败")
+        return False
+    
+    def _create_tone(self, frequency, duration=0.3):
+        """创建短音调"""
+        try:
+            # 获取当前音频设置
+            freq, size, channels = pygame.mixer.get_init()
+            sample_rate = freq
+            samples = int(sample_rate * duration)
+            
+            # 生成正弦波
+            t = np.linspace(0, duration, samples, False)
+            wave = np.sin(2 * np.pi * frequency * t) * 0.25  # 降低音量
+            
+            # 添加淡入淡出
+            fade_len = int(0.02 * sample_rate)  # 20ms淡入淡出
+            if len(wave) > 2 * fade_len:
+                wave[:fade_len] *= np.linspace(0, 1, fade_len)
+                wave[-fade_len:] *= np.linspace(1, 0, fade_len)
+            
+            # 转换为pygame格式
+            wave_int16 = (wave * 16383).astype(np.int16)
+            
+            if channels == 2:
+                stereo_wave = np.column_stack((wave_int16, wave_int16))
+            else:
+                stereo_wave = wave_int16
+            
+            return pygame.sndarray.make_sound(stereo_wave)
+        except Exception as e:
+            print(f"❌ 创建音调失败 {frequency}Hz: {e}")
+            return None
+    
+    def play_finger(self, finger):
+        """播放手指音调"""
+        try:
+            current_time = time.time() * 1000
+            
+            # 防抖检查
+            if current_time - self.last_change[finger] < self.debounce_time:
+                return
+            
+            if finger in self.sounds and self.sounds[finger] and not self.playing[finger]:
+                # 停止之前的播放
+                if finger in self.channels and self.channels[finger]:
+                    try:
+                        self.channels[finger].stop()
+                    except:
+                        pass
+                
+                # 播放新的音调
+                channel = self.sounds[finger].play()
+                if channel:
+                    self.channels[finger] = channel
+                    self.playing[finger] = True
+                    self.last_change[finger] = current_time
+                    
+        except Exception as e:
+            print(f"❌ 播放失败 {finger}: {e}")
+    
+    def stop_finger(self, finger):
+        """停止手指音调"""
+        try:
+            current_time = time.time() * 1000
+            
+            # 防抖检查
+            if current_time - self.last_change[finger] < self.debounce_time:
+                return
+                
+            if finger in self.channels and self.playing[finger]:
+                try:
+                    if self.channels[finger]:
+                        self.channels[finger].stop()
+                except:
+                    pass
+                
+                self.playing[finger] = False
+                self.last_change[finger] = current_time
+                
+        except Exception as e:
+            print(f"❌ 停止失败 {finger}: {e}")
+    
+    def update_finger_states(self, states_data):
+        """更新手指状态并播放音频"""
+        try:
+            for finger in self.frequencies:
+                if finger in states_data:
+                    if states_data[finger]:  # 弯曲
+                        if not self.playing[finger]:  # 只有在没有播放时才开始播放
+                            self.play_finger(finger)
+                    else:  # 伸直
+                        if self.playing[finger]:  # 只有在播放时才停止
+                            self.stop_finger(finger)
+        except Exception as e:
+            print(f"❌ 更新手指状态错误: {e}")
+    
+    def cleanup_dead_channels(self):
+        """清理已结束的通道"""
+        try:
+            for finger in list(self.channels.keys()):
+                if finger in self.channels and self.channels[finger]:
+                    if not self.channels[finger].get_busy():
+                        self.playing[finger] = False
+                        del self.channels[finger]
+        except Exception as e:
+            print(f"⚠️ 清理通道时出错: {e}")
+    
+    def stop_all(self):
+        """停止所有播放"""
+        for finger in self.frequencies:
+            if self.playing[finger]:
+                try:
+                    if finger in self.channels and self.channels[finger]:
+                        self.channels[finger].stop()
+                    self.playing[finger] = False
+                except Exception as e:
+                    print(f"⚠️ 停止{finger}时出错: {e}")
+    
+    def cleanup(self):
+        """清理资源"""
+        print("🧹 清理内置音频播放器...")
+        self.stop_all()
+        
+        try:
+            time.sleep(0.1)
+            pygame.mixer.quit()
+            print("🎵 音频系统已关闭")
+        except Exception as e:
+            print(f"⚠️ 清理时出错: {e}")
 
 def normalize_angle(angle, finger_name):
     """将角度归一化到0-1范围"""
@@ -298,18 +490,6 @@ def calculate_finger_angles_and_states(lmList):
     
     return angles, states
 
-def send_to_audio_player(audio_process, states_data):
-    """发送手势状态数据到音频播放器"""
-    try:
-        if audio_process and audio_process.stdin and not audio_process.stdin.closed:
-            json_msg = json.dumps(states_data, separators=(',', ':'))
-            audio_process.stdin.write(json_msg + '\n')
-            audio_process.stdin.flush()
-            return True
-    except Exception as e:
-        return False
-    return False
-
 def send_to_arduino(mcu_connection, normalized_angles):
     """发送归一化角度数据到Arduino"""
     try:
@@ -337,18 +517,12 @@ def setup_mcu_connection():
         print(f"⚠️ 串口连接设置失败: {e} (将继续运行，但不发送数据到Arduino)")
         return None
 
-def data_sender_thread(audio_process, mcu_connection, audio_data_queue, arduino_data_queue):
-    """优化的数据发送线程 - 分别处理音频和Arduino数据"""
+def arduino_sender_thread(mcu_connection, arduino_data_queue):
+    """Arduino数据发送线程"""
     global system_running, system_error
     
-    audio_interval = 1.0 / AUDIO_SEND_FREQUENCY
-    last_audio_send = 0
+    print(f"📡 Arduino发送线程启动 (频率: {ARDUINO_SEND_FREQUENCY:.1f}Hz)")
     
-    print(f"📡 数据发送线程启动:")
-    print(f"   音频频率: {AUDIO_SEND_FREQUENCY}Hz")
-    print(f"   Arduino频率: {ARDUINO_SEND_FREQUENCY:.1f}Hz (每{ARDUINO_AVERAGE_FRAMES}帧平均)")
-    
-    audio_count = 0
     arduino_count = 0
     error_count = 0
     last_heartbeat = time.time()
@@ -359,39 +533,19 @@ def data_sender_thread(audio_process, mcu_connection, audio_data_queue, arduino_
                 current_time = time.time()
                 
                 # 心跳检测
-                if current_time - last_heartbeat > 15:
-                    audio_queue_size = audio_data_queue.qsize()
+                if current_time - last_heartbeat > 20:
                     arduino_queue_size = arduino_data_queue.qsize()
-                    print(f"💗 发送线程心跳: Audio={audio_count}, Arduino={arduino_count}, "
-                          f"Errors={error_count}, AudioQ={audio_queue_size}, ArduinoQ={arduino_queue_size}")
+                    print(f"💗 Arduino线程心跳: 发送={arduino_count}, 错误={error_count}, 队列={arduino_queue_size}")
                     last_heartbeat = current_time
                     
-                    if error_count > 100:
-                        print("❌ 发送线程错误过多，标记系统错误")
-                        system_error = True
+                    if error_count > 50:
+                        print("❌ Arduino发送错误过多")
                         break
                     error_count = 0
                 
-                # 发送音频数据（高频）
-                if current_time - last_audio_send >= audio_interval:
-                    try:
-                        audio_data = None
-                        # 获取最新的音频数据
-                        while not audio_data_queue.empty():
-                            audio_data = audio_data_queue.get_nowait()
-                            audio_data_queue.task_done()
-                        
-                        if audio_data and send_to_audio_player(audio_process, audio_data):
-                            audio_count += 1
-                        elif audio_data:
-                            error_count += 1
-                    except Exception as e:
-                        error_count += 1
-                    last_audio_send = current_time
-                
-                # 发送Arduino数据（低频，来自平均后的数据）
+                # 发送Arduino数据
                 try:
-                    arduino_data = arduino_data_queue.get_nowait()
+                    arduino_data = arduino_data_queue.get(timeout=0.1)
                     arduino_data_queue.task_done()
                     
                     if mcu_connection and send_to_arduino(mcu_connection, arduino_data):
@@ -400,59 +554,37 @@ def data_sender_thread(audio_process, mcu_connection, audio_data_queue, arduino_
                         error_count += 1
                         
                 except queue.Empty:
-                    pass
+                    continue
                 except Exception as e:
                     error_count += 1
                 
-                time.sleep(0.005)  # 5ms间隔
-                
             except Exception as e:
-                print(f"❌ 发送线程内部错误: {e}")
+                print(f"❌ Arduino线程内部错误: {e}")
                 error_count += 1
                 time.sleep(0.1)
                 
     except Exception as e:
-        print(f"❌ 数据发送线程严重错误: {e}")
+        print(f"❌ Arduino发送线程严重错误: {e}")
         print(traceback.format_exc())
-        system_error = True
     
-    print(f"📡 发送线程退出: Audio={audio_count}, Arduino={arduino_count}")
+    print(f"📡 Arduino线程退出: 发送={arduino_count}")
 
 def main():
     global system_running, system_error
     
-    print("🎵 优化版手势识别音乐系统")
+    print("🎵 内置音频版手势识别系统")
     print("=" * 50)
     print(f"📊 配置信息:")
     print(f"   摄像头采集: {CAPTURE_FPS}FPS")
-    print(f"   音频发送: {AUDIO_SEND_FREQUENCY}Hz")
+    print(f"   音频播放: 内置直接调用")
     print(f"   Arduino发送: {ARDUINO_SEND_FREQUENCY:.1f}Hz (每{ARDUINO_AVERAGE_FRAMES}帧平均)")
     
-    # 启动音频播放器
-    audio_process = None
+    # 初始化内置音频播放器
+    audio_player = None
     try:
-        audio_process = subprocess.Popen(
-            [sys.executable, "realtime_audio_player.py"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-        
-        time.sleep(2)
-        
-        if audio_process.poll() is None:
-            print("✅ 实时音频播放器启动成功")
-        else:
-            print("❌ 实时音频播放器启动失败")
-            return
-            
-    except FileNotFoundError:
-        print("❌ 找不到 realtime_audio_player.py 文件")
-        return
+        audio_player = IntegratedAudioPlayer()
     except Exception as e:
-        print(f"❌ 音频系统启动错误: {e}")
+        print(f"❌ 音频播放器初始化失败: {e}")
         return
     
     # 设置单片机连接
@@ -460,23 +592,25 @@ def main():
     if MicrocontrollerConnection:
         mcu_connection = setup_mcu_connection()
     
-    # 创建两个独立的数据队列
-    audio_data_queue = queue.Queue(maxsize=3)    # 音频数据队列
-    arduino_data_queue = queue.Queue(maxsize=2)  # Arduino数据队列
+    # 创建Arduino数据队列
+    arduino_data_queue = queue.Queue(maxsize=2)
     
-    # 启动数据发送线程
-    sender_thread = threading.Thread(
-        target=data_sender_thread, 
-        args=(audio_process, mcu_connection, audio_data_queue, arduino_data_queue), 
-        daemon=True
-    )
-    sender_thread.start()
+    # 启动Arduino发送线程
+    arduino_thread = None
+    if mcu_connection:
+        arduino_thread = threading.Thread(
+            target=arduino_sender_thread, 
+            args=(mcu_connection, arduino_data_queue), 
+            daemon=True
+        )
+        arduino_thread.start()
     
     # 主循环变量
     prevTime = 0
     frame_count = 0
     last_gc_time = time.time()
     last_status_time = time.time()
+    last_cleanup_time = time.time()
     
     # Arduino数据平均缓存
     arduino_angle_buffer = {
@@ -506,7 +640,7 @@ def main():
         
         print("\n🚀 系统启动完成！")
         print("📸 摄像头已就绪")
-        print("🎵 音频播放已就绪")
+        print("🎵 内置音频播放器已就绪")
         if mcu_connection:
             print("📡 Arduino串口通信已就绪")
         print("💡 弯曲手指即可播放音乐！")
@@ -530,18 +664,17 @@ def main():
                     gc.collect()
                     last_gc_time = current_time
                 
+                # 定期清理音频通道
+                if current_time - last_cleanup_time > 2:
+                    audio_player.cleanup_dead_channels()
+                    last_cleanup_time = current_time
+                
                 # 定期状态检查
                 if current_time - last_status_time > 30:
-                    audio_queue_size = audio_data_queue.qsize()
-                    arduino_queue_size = arduino_data_queue.qsize()
-                    print(f"💗 主线程心跳: Frame={frame_count}, AudioQ={audio_queue_size}, "
+                    arduino_queue_size = arduino_data_queue.qsize() if mcu_connection else 0
+                    playing_count = sum(1 for p in audio_player.playing.values() if p)
+                    print(f"💗 主线程心跳: Frame={frame_count}, 音频播放={playing_count}/5, "
                           f"ArduinoQ={arduino_queue_size}, ArduinoSent={arduino_send_count}")
-                    
-                    # 检查音频进程状态
-                    if audio_process and audio_process.poll() is not None:
-                        print("⚠️ 音频进程已退出，标记系统错误")
-                        system_error = True
-                        break
                     
                     last_status_time = current_time
                     arduino_send_count = 0
@@ -558,16 +691,8 @@ def main():
                     current_angles = {"thumb": 180, "index": 180, "middle": 180, "ring": 180, "pinky": 180}
                     current_states = {"thumb": False, "index": False, "middle": False, "ring": False, "pinky": False}
                 
-                # 每帧都发送音频数据（高频）
-                try:
-                    audio_data_queue.put_nowait(current_states.copy())
-                except queue.Full:
-                    try:
-                        audio_data_queue.get_nowait()
-                        audio_data_queue.task_done()
-                        audio_data_queue.put_nowait(current_states.copy())
-                    except:
-                        pass
+                # 直接更新音频播放器状态（零延迟）
+                audio_player.update_finger_states(current_states)
                 
                 # Arduino数据累积和平均处理
                 normalized_angles = normalize_angles_dict(current_angles)
@@ -577,7 +702,7 @@ def main():
                     arduino_angle_buffer[finger].append(normalized_angles[finger])
                 
                 # 每N帧计算平均值并发送Arduino数据
-                if frame_count % ARDUINO_AVERAGE_FRAMES == 0:
+                if frame_count % ARDUINO_AVERAGE_FRAMES == 0 and mcu_connection:
                     # 计算平均值
                     averaged_angles = {}
                     for finger in arduino_angle_buffer:
@@ -618,9 +743,17 @@ def main():
                         angle = current_angles[finger]
                         normalized = normalized_angles[finger]
                         state = current_states[finger]
-                        color = (0, 255, 0) if not state else (0, 0, 255)
+                        playing = audio_player.playing[finger]
                         
-                        state_text = "Bent" if state else "Straight"
+                        # 显示颜色：绿色=伸直，红色=弯曲，蓝色=播放中
+                        if playing:
+                            color = (255, 0, 0)  # 蓝色 - 播放中
+                        elif state:
+                            color = (0, 0, 255)  # 红色 - 弯曲
+                        else:
+                            color = (0, 255, 0)  # 绿色 - 伸直
+                        
+                        state_text = "Playing" if playing else ("Bent" if state else "Straight")
                         text = f"{name}: {angle:.1f}° (N:{normalized:.3f}) {state_text}"
                         
                         cv2.putText(frame, text, (10, y_offset + i * 22), 
@@ -633,12 +766,9 @@ def main():
                 status_y = y_offset + 5 * 22 + 20
                 
                 # 音频状态
-                if audio_process and audio_process.poll() is None:
-                    audio_status = f"Audio: {AUDIO_SEND_FREQUENCY}Hz - Running"
-                    audio_color = (0, 255, 0)
-                else:
-                    audio_status = f"Audio: {AUDIO_SEND_FREQUENCY}Hz - Stopped"
-                    audio_color = (0, 0, 255)
+                playing_count = sum(1 for p in audio_player.playing.values() if p)
+                audio_status = f"Audio: Built-in - {playing_count}/5 Playing"
+                audio_color = (0, 255, 0) if playing_count > 0 else (0, 255, 255)
                 cv2.putText(frame, audio_status, (10, status_y), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, audio_color, 1)
                 
@@ -653,9 +783,8 @@ def main():
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, arduino_color, 1)
                 
                 # 队列状态
-                audio_queue_size = audio_data_queue.qsize()
-                arduino_queue_size = arduino_data_queue.qsize()
-                cv2.putText(frame, f"AudioQ: {audio_queue_size}/3, ArduinoQ: {arduino_queue_size}/2", 
+                arduino_queue_size = arduino_data_queue.qsize() if mcu_connection else 0
+                cv2.putText(frame, f"ArduinoQ: {arduino_queue_size}/2, Direct Audio", 
                            (10, status_y + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
                 
                 # 系统状态
@@ -709,37 +838,23 @@ def main():
             except Exception as e:
                 print(f"⚠️ 关闭Arduino连接时出错: {e}")
         
-        # 等待发送线程结束
-        if 'sender_thread' in locals():
+        # 等待Arduino线程结束
+        if arduino_thread:
             try:
-                sender_thread.join(timeout=3)
-                print("📡 发送线程已结束")
+                arduino_thread.join(timeout=3)
+                print("📡 Arduino线程已结束")
             except:
-                print("⚠️ 发送线程强制结束")
+                print("⚠️ Arduino线程强制结束")
         
-        # 关闭音频播放器进程
-        if audio_process:
+        # 清理内置音频播放器
+        if audio_player:
             try:
-                if audio_process.stdin and not audio_process.stdin.closed:
-                    audio_process.stdin.close()
-                audio_process.terminate()
-                
-                # 等待进程结束
-                try:
-                    audio_process.wait(timeout=5)
-                    print("🎵 音频播放器已正常关闭")
-                except subprocess.TimeoutExpired:
-                    audio_process.kill()
-                    audio_process.wait()
-                    print("🎵 音频播放器已强制关闭")
+                audio_player.cleanup()
             except Exception as e:
-                print(f"⚠️ 关闭音频播放器时出错: {e}")
+                print(f"⚠️ 清理音频播放器时出错: {e}")
         
         # 清理队列
         try:
-            while not audio_data_queue.empty():
-                audio_data_queue.get_nowait()
-                audio_data_queue.task_done()
             while not arduino_data_queue.empty():
                 arduino_data_queue.get_nowait()
                 arduino_data_queue.task_done()
